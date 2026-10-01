@@ -40,6 +40,8 @@ import { RuleDialog, type RuleDialogInitialData } from '@/components/rule-dialog
 import { TransactionAttachments } from '@/components/transaction-attachments'
 import type { AttachmentPreview } from '@/components/transaction-attachments'
 import { TransactionSplitsSection } from '@/components/transaction-splits-section'
+import { usePrivacyMode } from '@/hooks/use-privacy-mode'
+import type { Transaction, RecurringTransaction, TransactionSplitsInput, CategoryGroup, Category } from '@/types'
 import { buildInstallmentSeriesInput, hasNonStatusChange, isManualInstallmentSeriesRow } from '@/lib/installment-series'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import type { Transaction, RecurringTransaction, TransactionSplitsInput, TransactionEditPayload, InstallmentSeriesInput, TransactionApplyScope, CategoryGroup, Category, Rule, RuleCondition, RuleConditionNode } from '@/types'
@@ -1011,6 +1013,8 @@ function TransactionForm({
             />
           ) : (
             <Input
+              type="number"
+              step="0.01"
               type="text"
               inputMode="decimal"
               value={amount}
@@ -1083,6 +1087,11 @@ function TransactionForm({
                 />
               ) : (
                 <Input
+                  type="number"
+                  step="0.01"
+                  value={convertedAmount}
+                  onChange={(e) => handleConvertedAmountChange(e.target.value)}
+                  placeholder={t('transactions.autoCalculated')}
                   type="text"
                   inputMode="decimal"
                   value={convertedAmount}
