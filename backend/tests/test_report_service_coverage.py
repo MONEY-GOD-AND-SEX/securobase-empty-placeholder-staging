@@ -107,13 +107,13 @@ async def _add_txn(
     amount: float, txn_type: str, txn_date: date, *,
     source: str = "manual", category_id: uuid.UUID | None = None,
     currency: str = "BRL", effective_date: date | None = None,
-    workspace_id: uuid.UUID | None = None,
+    workspace_id: uuid.UUID | None = None, status: str = "posted",
 ) -> Transaction:
     txn = Transaction(
         id=uuid.uuid4(), user_id=user_id, account_id=account_id,
         category_id=category_id, description=f"Test {txn_type} {amount}",
         amount=Decimal(str(amount)), date=txn_date, type=txn_type,
-        source=source, currency=currency,
+        source=source, status=status, currency=currency,
         effective_date=effective_date or txn_date,
         created_at=datetime.now(timezone.utc),
     )
@@ -195,13 +195,17 @@ async def test_income_expenses_basic_structure(session, test_user, test_workspac
     )
 
     assert report.meta.type == "income_expenses"
-    assert report.meta.series_keys == ["income", "expenses"]
+    assert report.meta.series_keys == [
+        "income", "expenses", "projectedIncome", "projectedExpenses"
+    ]
     assert report.meta.currency == "BRL"
     assert report.meta.interval == "monthly"
 
     bd = {b.key: b.value for b in report.summary.breakdowns}
     assert bd["income"] == pytest.approx(5000.0)
     assert bd["expenses"] == pytest.approx(1500.0)
+    assert bd["projectedIncome"] == pytest.approx(0.0)
+    assert bd["projectedExpenses"] == pytest.approx(0.0)
     assert bd["netIncome"] == pytest.approx(3500.0)
 
     # Composition contains the two named categories + uncategorized
@@ -214,6 +218,8 @@ async def test_income_expenses_basic_structure(session, test_user, test_workspac
     for dp in report.trend:
         assert "income" in dp.breakdowns
         assert "expenses" in dp.breakdowns
+        assert "projectedIncome" in dp.breakdowns
+        assert "projectedExpenses" in dp.breakdowns
 
     # Category trend present with proper grouping
     groups = {ct.group for ct in report.category_trend}
@@ -306,11 +312,32 @@ async def test_income_expenses_with_recurring_projection(session, test_user, tes
         session, test_workspace.id, test_user.id, months=2, interval="monthly"
     )
     bd = {b.key: b.value for b in report.summary.breakdowns}
-    assert bd["expenses"] >= 800.0
-    assert bd["income"] >= 1500.0
+    assert bd["expenses"] == pytest.approx(0.0)
+    assert bd["income"] == pytest.approx(0.0)
+    assert bd["projectedExpenses"] >= 800.0
+    assert bd["projectedIncome"] >= 1500.0
 
     labels = {c.label for c in report.composition}
     assert "Rent" in labels
+
+
+async def test_income_expenses_pending_is_projected_not_actual(
+    session, test_user, test_workspace
+):
+    """Pending rows belong to the payable forecast, never actual P&L."""
+    acct = await _make_account(session, test_user.id, "IE Pending")
+    today = date.today()
+    await _add_txn(session, test_user.id, acct.id, 100, "debit", today)
+    await _add_txn(
+        session, test_user.id, acct.id, 50, "debit", today, status="pending"
+    )
+
+    report = await get_income_expenses_report(
+        session, test_workspace.id, test_user.id, months=1, interval="monthly"
+    )
+    bd = {b.key: b.value for b in report.summary.breakdowns}
+    assert bd["expenses"] == pytest.approx(100.0)
+    assert bd["projectedExpenses"] == pytest.approx(50.0)
 
 
 async def test_income_expenses_many_categories_triggers_other_bucket(session, test_user, test_workspace):
@@ -585,6 +612,31 @@ async def test_income_expenses_owner_split_offset(session, test_user, test_works
     assert dinner.value == pytest.approx(600.0)
 
 
+async def test_income_expenses_trend_points_have_per_period_composition(session, test_user, test_workspace):
+    """Each income/expenses trend DataPoint carries per-period composition items."""
+    cat_wages = await _make_category(session, test_user.id, "Wages", color="#0E0")
+    cat_groceries = await _make_category(session, test_user.id, "Groceries", color="#E00")
+    acct = await _make_account(session, test_user.id, "IE Trend Acct")
+    today = date.today()
+
+    await _add_txn(session, test_user.id, acct.id, 4000, "credit", today, category_id=cat_wages.id)
+    await _add_txn(session, test_user.id, acct.id, 900, "debit", today, category_id=cat_groceries.id)
+
+    report = await get_income_expenses_report(
+        session, test_workspace.id, test_user.id, months=2, interval="monthly"
+    )
+
+    # The last trend point always covers the current period where transactions landed
+    current_dp = report.trend[-1]
+    assert len(current_dp.composition) > 0
+    groups = {c.group for c in current_dp.composition}
+    assert "income" in groups
+    assert "expenses" in groups
+    labels = {c.label for c in current_dp.composition}
+    assert "Wages" in labels
+    assert "Groceries" in labels
+
+
 async def test_net_worth_composition_positive_checking_in_accounts_group(session, test_user, test_workspace):
     """A manual checking account with positive balance lands in the accounts group."""
     acct = await _make_account(session, test_user.id, "NW Pos Checking")
@@ -688,6 +740,8 @@ async def test_cash_flow_baseline_amount_primary_used(session, test_user, test_w
         session, test_workspace.id, test_user.id, months=2, interval="daily", baseline=True
     )
     assert report.meta.baseline_active is True
+
+    assert report.meta.baseline_lookback_days is not None
     assert report.meta.baseline_lookback_days > 0
 
 
@@ -727,3 +781,66 @@ async def test_cash_flow_accrual_mode_pending_cc(session, test_user, test_worksp
     )
     assert report.meta.type == "cash_flow"
     assert len(report.trend) > 0
+
+
+@pytest.mark.parametrize('interval', ['daily', 'monthly', 'yearly'])
+@pytest.mark.parametrize('end', [date(2022, 3, 20), date(2026, 9, 12)])
+async def test_custom_income_expenses_only_include_in_range_actuals(
+    session, test_user, test_workspace, monkeypatch, interval, end,
+):
+    from app.models.invoice import Invoice
+    from app.services import report_service
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 9, 12)
+
+    monkeypatch.setattr(report_service, 'date', FixedDate)
+    start = end.replace(day=10)
+    currency = test_user.primary_currency
+    account = await _make_account(session, test_user.id, 'Custom actuals', currency=currency)
+    category = await _make_category(session, test_user.id, 'Actual category')
+    for amount, kind, day, status in [
+        (100, 'credit', start, 'posted'),
+        (-30, 'debit', end, 'posted'),
+        (500, 'credit', start - timedelta(days=1), 'posted'),
+        (-700, 'debit', end + timedelta(days=1), 'posted'),
+        (900, 'credit', start, 'pending'),
+        (-800, 'debit', end, 'pending'),
+    ]:
+        await _add_txn(session, test_user.id, account.id, amount, kind, day,
+                       status=status, category_id=category.id, currency=currency)
+    recurring = await _make_recurring(
+        session, test_user.id, account.id, 600, 'credit',
+        next_occurrence=start, category_id=category.id, currency=currency,
+    )
+    recurring.start_date = start
+    session.add(Invoice(
+        workspace_id=test_workspace.id, user_id=test_user.id, status='open',
+        issue_date=start, due_date=start, currency=currency, total=Decimal('1100'),
+        direction='receivable', number=1, series='TEST',
+    ))
+    await session.commit()
+
+    report = await get_income_expenses_report(
+        session, test_workspace.id, test_user.id, interval=interval,
+        start_date=start, end_date=end,
+    )
+    totals = {item.key: item.value for item in report.summary.breakdowns}
+    assert totals['income'] == 100
+    assert totals['expenses'] == 30
+    assert totals['projectedIncome'] == totals['projectedExpenses'] == 0
+    assert report.summary.primary_value == 70
+    assert sum(point.breakdowns['income'] for point in report.trend) == 100
+    assert sum(point.breakdowns['expenses'] for point in report.trend) == 30
+    assert all(point.breakdowns['projectedIncome'] == 0 and
+               point.breakdowns['projectedExpenses'] == 0 for point in report.trend)
+    assert {item.group: item.value for item in report.composition} == {
+        'income': 100, 'expenses': 30,
+    }
+    assert {item.group: item.total for item in report.category_trend} == {
+        'income': 100, 'expenses': 30,
+    }
+    for item in report.category_trend:
+        assert sum(point.value for point in item.series) == item.total

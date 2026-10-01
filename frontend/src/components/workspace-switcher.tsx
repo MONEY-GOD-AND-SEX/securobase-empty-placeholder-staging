@@ -7,6 +7,7 @@ import { useAuth } from '@/contexts/auth-context'
 import { useWorkspace } from '@/contexts/workspace-context'
 import { workspaces as workspacesApi } from '@/lib/api'
 import { resolveSupportedLang } from '@/lib/i18n'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -43,9 +44,15 @@ import {
   Shield,
   ShieldCheck,
   Sparkles,
+  Fingerprint,
 } from 'lucide-react'
 import { CategoryIcon } from '@/components/category-icon'
-import type { Workspace } from '@/types'
+import {
+  WORKSPACE_KINDS,
+  WORKSPACE_KIND_ICON,
+  WORKSPACE_KIND_LABEL_KEY,
+} from '@/lib/workspace-kinds'
+import type { Workspace, WorkspaceKind } from '@/types'
 
 const ROLE_LABEL_KEY: Record<string, string> = {
   owner: 'workspace.roleOwner',
@@ -54,35 +61,33 @@ const ROLE_LABEL_KEY: Record<string, string> = {
   manager: 'workspace.roleManager',
 }
 
-// Fallbacks when a workspace hasn't set its own icon/color yet.
-const DEFAULT_ICON_BY_KIND: Record<string, string> = {
-  personal: 'user',
-  freelancer: 'briefcase',
-  small_business: 'building-2',
-  accountant_firm: 'landmark',
-}
+// Fallback when a workspace hasn't set its own color yet.
 const DEFAULT_COLOR = '#6366F1'
 
 function workspaceIcon(w: Workspace): string {
-  return w.icon || DEFAULT_ICON_BY_KIND[w.kind] || 'briefcase'
+  return w.icon || WORKSPACE_KIND_ICON[w.kind as WorkspaceKind] || 'briefcase'
 }
 function workspaceColor(w: Workspace): string {
   return w.color || DEFAULT_COLOR
 }
 
 interface AccountMenuProps {
-  /** Backup download in progress — disables the menu item. */
-  backingUp: boolean
   /** Open the change-password dialog. */
   onChangePassword: () => void
   /** Open the 2FA setup dialog. */
   onTwoFactor: () => void
+  /** Open the passkey management dialog. */
+  onPasskeys: () => void
   /** Trigger a backup download. */
   onBackup: () => void
   /** Open the "Update available" dialog. */
   onUpdateAvailable: () => void
   /** True when the AGENTS_ENABLED env flag is on. */
   agentsEnabled: boolean
+  /** True when local password/passkey auth is enabled. */
+  localAuthEnabled: boolean
+  /** Compact the trigger to its workspace icon on desktop. */
+  collapsed?: boolean
 }
 
 /**
@@ -95,12 +100,14 @@ interface AccountMenuProps {
  * only needs to trigger them.
  */
 export function WorkspaceSwitcher({
-  backingUp,
   onChangePassword,
   onTwoFactor,
+  onPasskeys,
   onBackup,
   onUpdateAvailable,
   agentsEnabled,
+  localAuthEnabled,
+  collapsed = false,
 }: AccountMenuProps) {
   const { t, i18n } = useTranslation()
   const navigate = useNavigate()
@@ -108,6 +115,7 @@ export function WorkspaceSwitcher({
   const { user, logout } = useAuth()
   const [createOpen, setCreateOpen] = useState(false)
   const [newName, setNewName] = useState('')
+  const [newKind, setNewKind] = useState<WorkspaceKind>('personal')
 
   const currentLang = resolveSupportedLang(i18n.resolvedLanguage ?? i18n.language)
 
@@ -115,7 +123,9 @@ export function WorkspaceSwitcher({
     mutationFn: () =>
       workspacesApi.create({
         name: newName.trim(),
+        kind: newKind,
         self_membership: true,
+        locale: currentLang,
       }),
     onSuccess: async (ws) => {
       toast.success(t('workspace.createSuccess', 'Workspace created'))
@@ -123,6 +133,7 @@ export function WorkspaceSwitcher({
       await switchWorkspace(ws.id)
       setCreateOpen(false)
       setNewName('')
+      setNewKind('personal')
       navigate('/workspace/settings')
     },
     onError: (e: unknown) => {
@@ -144,14 +155,21 @@ export function WorkspaceSwitcher({
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <button className="flex items-center gap-3 w-full rounded-lg px-3 py-2.5 text-sm hover:bg-sidebar-accent transition-colors text-left">
+          <button
+            className={cn(
+              'flex items-center gap-3 w-full rounded-lg px-3 py-2.5 text-sm hover:bg-sidebar-accent transition-colors text-left',
+              collapsed && 'lg:justify-center lg:px-2',
+            )}
+            aria-label={current.name}
+            title={current.name}
+          >
             <CategoryIcon
               icon={workspaceIcon(current)}
               color={workspaceColor(current)}
               size="sm"
               className="shrink-0"
             />
-            <div className="flex-1 min-w-0">
+            <div className={cn('flex-1 min-w-0', collapsed && 'lg:hidden')}>
               <p className="text-xs font-semibold truncate">{current.name}</p>
               <p className="text-[10px] text-sidebar-muted/70 truncate">
                 {user.email}
@@ -160,7 +178,7 @@ export function WorkspaceSwitcher({
                 )}
               </p>
             </div>
-            <ChevronsUpDown size={13} className="text-sidebar-muted/60 shrink-0" />
+            <ChevronsUpDown size={13} className={cn('text-sidebar-muted/60 shrink-0', collapsed && 'lg:hidden')} />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-64" side="top">
@@ -226,27 +244,37 @@ export function WorkspaceSwitcher({
           )}
 
           {/* Account actions */}
+          {localAuthEnabled && (
+            <DropdownMenuItem
+              onClick={onChangePassword}
+              className="flex items-center gap-2"
+            >
+              <KeyRound size={14} />
+              {t('auth.changePassword')}
+            </DropdownMenuItem>
+          )}
+          {(localAuthEnabled || user.is_2fa_enabled) && (
+            <DropdownMenuItem
+              onClick={onTwoFactor}
+              className="flex items-center gap-2"
+            >
+              <ShieldCheck size={14} />
+              {t(localAuthEnabled ? 'auth.twoFactorTitle' : 'auth.disable2fa')}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem
-            onClick={onChangePassword}
+            onClick={onPasskeys}
             className="flex items-center gap-2"
           >
-            <KeyRound size={14} />
-            {t('auth.changePassword')}
+            <Fingerprint size={14} />
+            {t('auth.passkeysTitle')}
           </DropdownMenuItem>
           <DropdownMenuItem
-            onClick={onTwoFactor}
-            className="flex items-center gap-2"
-          >
-            <ShieldCheck size={14} />
-            {t('auth.twoFactorTitle')}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={backingUp}
             onClick={onBackup}
             className="flex items-center gap-2"
           >
             <HardDriveDownload size={14} />
-            {backingUp ? t('backup.downloading') : t('backup.button')}
+            {t('backup.button')}
           </DropdownMenuItem>
 
           {agentsEnabled && (
@@ -282,11 +310,39 @@ export function WorkspaceSwitcher({
                   {t('setup.language')}
                 </DropdownMenuLabel>
                 <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('ru')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Русский</span>
+                  {currentLang === 'ru' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('de')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Deutsch</span>
+                  {currentLang === 'de' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('uk')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Українська</span>
+                  {currentLang === 'uk' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
                   onClick={() => i18n.changeLanguage('pt-BR')}
                   className="flex items-center gap-2"
                 >
-                  <span className="flex-1">Português</span>
+                  <span className="flex-1">Português (BR)</span>
                   {currentLang === 'pt-BR' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('pt-PT')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Português (PT)</span>
+                  {currentLang === 'pt-PT' && <Check size={13} className="text-primary" />}
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => i18n.changeLanguage('en')}
@@ -303,6 +359,13 @@ export function WorkspaceSwitcher({
                   {currentLang === 'es' && <Check size={13} className="text-primary" />}
                 </DropdownMenuItem>
                 <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('hi')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">हिन्दी</span>
+                  {currentLang === 'hi' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
                   onClick={() => i18n.changeLanguage('pl')}
                   className="flex items-center gap-2"
                 >
@@ -315,6 +378,41 @@ export function WorkspaceSwitcher({
                 >
                   <span className="flex-1">Italiano</span>
                   {currentLang === 'it' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('fr')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Français</span>
+                  {currentLang === 'fr' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('nl')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Nederlands</span>
+                  {currentLang === 'nl' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('sk')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Slovenčina</span>
+                  {currentLang === 'sk' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('el')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">Ελληνικά</span>
+                  {currentLang === 'el' && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => i18n.changeLanguage('ja')}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1">日本語</span>
+                  {currentLang === 'ja' && <Check size={13} className="text-primary" />}
                 </DropdownMenuItem>
               </DropdownMenuSubContent>
             </DropdownMenuPortal>
@@ -358,6 +456,43 @@ export function WorkspaceSwitcher({
                 autoFocus
                 maxLength={100}
               />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-[13px]">{t('workspace.kind', 'Type')}</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {WORKSPACE_KINDS.map((kind) => {
+                  const isSelected = kind === newKind
+                  return (
+                    <button
+                      key={kind}
+                      type="button"
+                      onClick={() => setNewKind(kind)}
+                      aria-pressed={isSelected}
+                      className={`flex items-center gap-2.5 rounded-lg border p-3 text-left transition-colors ${
+                        isSelected
+                          ? 'border-primary bg-primary/5'
+                          : 'border-input hover:bg-muted/40'
+                      }`}
+                    >
+                      <CategoryIcon
+                        icon={WORKSPACE_KIND_ICON[kind]}
+                        color={isSelected ? DEFAULT_COLOR : '#94A3B8'}
+                        size="sm"
+                        className="shrink-0"
+                      />
+                      <span className="text-[13px] font-medium leading-tight">
+                        {t(WORKSPACE_KIND_LABEL_KEY[kind])}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                {t(
+                  'workspace.kindHint',
+                  "Pick what this workspace tracks. This can't be changed later.",
+                )}
+              </p>
             </div>
           </div>
           <DialogFooter className="mt-2">

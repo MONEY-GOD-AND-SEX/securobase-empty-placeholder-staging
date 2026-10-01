@@ -1,3 +1,4 @@
+import uuid
 from typing import TYPE_CHECKING, Optional
 
 from fastapi_users.db import SQLAlchemyBaseUserTableUUID
@@ -10,6 +11,7 @@ if TYPE_CHECKING:
     from app.models.category import Category
     from app.models.category_group import CategoryGroup
     from app.models.bank_connection import BankConnection
+    from app.models.passkey import UserPasskey
 
 
 class User(SQLAlchemyBaseUserTableUUID, Base):
@@ -18,12 +20,24 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
         UniqueConstraint("oidc_issuer", "oidc_subject", name="uq_users_oidc_identity"),
     )
 
+    if TYPE_CHECKING:
+        # fastapi-users declares its inherited columns as plain types (e.g.
+        # `email: str`) under its own TYPE_CHECKING branch, so `ty` can't see
+        # them as SQLAlchemy `Mapped` attributes (`.ilike()`, `.in_()`, ...).
+        # Re-annotate them here so type checkers treat them as real mapped
+        # columns everywhere.
+        id: Mapped[uuid.UUID]
+        email: Mapped[str]
+        hashed_password: Mapped[str]
+        is_active: Mapped[bool]
+        is_superuser: Mapped[bool]
+        is_verified: Mapped[bool]
+
     preferences: Mapped[Optional[dict]] = mapped_column(
         JSON,
         default=lambda: {
             "language": "en",
             "date_format": "MM/DD/YYYY",
-            "timezone": "UTC",
             "currency_display": "USD",
         },
     )
@@ -36,6 +50,7 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     categories: Mapped[list["Category"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     category_groups: Mapped[list["CategoryGroup"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     bank_connections: Mapped[list["BankConnection"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    passkeys: Mapped[list["UserPasskey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
     @property
     def primary_currency(self) -> str:

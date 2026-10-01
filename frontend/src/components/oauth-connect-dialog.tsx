@@ -15,6 +15,7 @@ type Institution = {
   name: string
   display_name: string
   country: string
+  max_consent_days?: number | null
   logo?: string | null
 }
 
@@ -22,6 +23,7 @@ interface OAuthConnectDialogProps {
   open: boolean
   onClose: () => void
   provider: string
+  supportsAssetSync?: boolean
 }
 
 const LAST_COUNTRY_KEY = 'securo:lastOAuthCountry'
@@ -39,50 +41,52 @@ function countryLabel(code: string): string {
   return REGION_NAMES.of(code) || code
 }
 
-export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDialogProps) {
+export function OAuthConnectDialog(props: OAuthConnectDialogProps) {
+  return props.open ? <OAuthConnectSession key={props.provider} {...props} /> : null
+}
+
+function OAuthConnectSession({ open, onClose, provider, supportsAssetSync = false }: OAuthConnectDialogProps) {
   const { t } = useTranslation()
   const [step, setStep] = useState<'country' | 'bank'>('country')
   const [country, setCountry] = useState<string | null>(null)
   const [countries, setCountries] = useState<string[]>([])
   const [institutions, setInstitutions] = useState<Institution[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [loadingCountries, setLoadingCountries] = useState(true)
+  const [loadingBanks, setLoadingBanks] = useState(false)
+  const loading = loadingCountries || loadingBanks
+  const [error, setError] = useState(false)
   const [redirecting, setRedirecting] = useState(false)
+  const [syncAssets, setSyncAssets] = useState(true)
 
-  // Reset when dialog opens.
   useEffect(() => {
-    if (!open) return
-    setStep('country')
-    setCountry(null)
-    setInstitutions([])
-    setError(null)
-    setRedirecting(false)
-    setLoading(true)
+    let cancelled = false
     connections
       .listInstitutions(provider)
       .then((data) => {
+        if (cancelled) return
         setCountries(data.countries)
         const stored = localStorage.getItem(LAST_COUNTRY_KEY)
         if (stored && data.countries.includes(stored)) {
+          setLoadingBanks(true)
           setCountry(stored)
           setStep('bank')
         }
       })
-      .catch(() => setError(t('accounts.loadingInstitutionsError')))
-      .finally(() => setLoading(false))
-  }, [open, provider, t])
+      .catch(() => { if (!cancelled) setError(true) })
+      .finally(() => { if (!cancelled) setLoadingCountries(false) })
+    return () => { cancelled = true }
+  }, [provider])
 
-  // Load banks when a country is picked.
   useEffect(() => {
-    if (!open || !country || step !== 'bank') return
-    setLoading(true)
-    setError(null)
+    if (!country || step !== 'bank') return
+    let cancelled = false
     connections
       .listInstitutions(provider, country)
-      .then((data) => setInstitutions(data.institutions))
-      .catch(() => setError(t('accounts.loadingInstitutionsError')))
-      .finally(() => setLoading(false))
-  }, [open, provider, country, step, t])
+      .then((data) => { if (!cancelled) setInstitutions(data.institutions) })
+      .catch(() => { if (!cancelled) setError(true) })
+      .finally(() => { if (!cancelled) setLoadingBanks(false) })
+    return () => { cancelled = true }
+  }, [provider, country, step])
 
   const sortedCountries = useMemo(
     () =>
@@ -93,9 +97,17 @@ export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDial
   )
 
   const handleCountrySelect = (code: string) => {
+    setLoadingBanks(true)
+    setError(false)
     setCountry(code)
     localStorage.setItem(LAST_COUNTRY_KEY, code)
     setStep('bank')
+  }
+
+  const handleBack = () => {
+    setStep('country')
+    setLoadingBanks(false)
+    setError(false)
   }
 
   const handleBankSelect = async (institution: Institution) => {
@@ -105,6 +117,8 @@ export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDial
       const url = await connections.getOAuthUrl(provider, {
         country,
         institution_name: institution.name,
+        valid_until_days: institution.max_consent_days,
+        ...(supportsAssetSync ? { sync_assets: syncAssets } : {}),
       })
       window.location.assign(url)
     } catch (e) {
@@ -121,7 +135,7 @@ export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDial
           <DialogTitle className="flex items-center gap-2">
             {step === 'bank' && (
               <button
-                onClick={() => setStep('country')}
+                onClick={handleBack}
                 className="text-muted-foreground hover:text-foreground"
                 aria-label={t('accounts.back')}
               >
@@ -137,6 +151,24 @@ export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDial
           </p>
         </DialogHeader>
 
+        {!redirecting && supportsAssetSync && (
+          <div className="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
+            <div className="space-y-1">
+              <label htmlFor="oauth-sync-assets" className="text-sm font-medium text-foreground">
+                {t('connections.syncAssets')}
+              </label>
+              <p className="text-xs text-muted-foreground">{t('connections.syncAssetsHint')}</p>
+            </div>
+            <input
+              id="oauth-sync-assets"
+              type="checkbox"
+              checked={syncAssets}
+              onChange={(e) => setSyncAssets(e.target.checked)}
+              className="mt-1 h-4 w-4 rounded border-border text-primary focus:ring-primary"
+            />
+          </div>
+        )}
+
         {redirecting ? (
           <div className="py-12 flex flex-col items-center gap-3">
             <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
@@ -147,7 +179,7 @@ export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDial
             <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
           </div>
         ) : error ? (
-          <div className="py-8 text-center text-sm text-destructive">{error}</div>
+          <div className="py-8 text-center text-sm text-destructive">{t('accounts.loadingInstitutionsError')}</div>
         ) : step === 'country' ? (
           <div className="space-y-1 pt-2 max-h-[60vh] overflow-y-auto">
             {sortedCountries.length === 0 ? (
@@ -208,7 +240,7 @@ export function OAuthConnectDialog({ open, onClose, provider }: OAuthConnectDial
               ))
             )}
             <div className="pt-2">
-              <Button variant="ghost" size="sm" onClick={() => setStep('country')}>
+              <Button variant="ghost" size="sm" onClick={handleBack}>
                 <ChevronLeft size={14} className="mr-1" />
                 {t('accounts.back')}
               </Button>

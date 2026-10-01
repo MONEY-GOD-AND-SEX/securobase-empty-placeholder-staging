@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from datetime import date
@@ -18,6 +20,7 @@ from app.providers.base import (
     HoldingData,
     RefreshOutcome,
     TransactionData,
+    mask_last4,
 )
 from app.providers.pluggy_constants import pluggy_icon_for_compe
 
@@ -101,6 +104,40 @@ def _decimal_or_none(value) -> Optional[Decimal]:
         return Decimal(str(value))
     except (ValueError, TypeError, InvalidOperation):
         return None
+
+
+def _consolidated_credit_balance_group(
+    credit_data: dict, account_balance, currency: str,
+) -> Optional[str]:
+    balance = _decimal_or_none(account_balance)
+    if balance is None:
+        return None
+
+    for line in credit_data.get("disaggregatedCreditLimits") or []:
+        if not isinstance(line, dict):
+            continue
+        if str(line.get("consolidationType") or "").upper() != "CONSOLIDADO":
+            continue
+        if str(line.get("creditLineLimitType") or "").upper() != "LIMITE_CREDITO_TOTAL":
+            continue
+        used = _decimal_or_none(line.get("usedAmount"))
+        if used is None or used != balance:
+            continue
+
+        limit = _decimal_or_none(line.get("customizedLimitAmount"))
+        if limit is None:
+            limit = _decimal_or_none(line.get("limitAmount"))
+        if limit is None:
+            continue
+        identity = {
+            "currency": currency,
+            "line_name": str(line.get("lineName") or "").upper(),
+            "limit": str(limit.normalize()),
+            "used": str(used.normalize()),
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+    return None
 
 
 def _date_or_none(value) -> Optional[date]:
@@ -193,7 +230,7 @@ def _build_bill_data(raw: dict) -> Optional[BillData]:
 
 def _build_account_data(acc: dict, type_mapper) -> AccountData:
     """Map a Pluggy account payload to AccountData, including creditData when present."""
-    account_type = type_mapper(acc.get("type", ""))
+    account_type = type_mapper(acc.get("type", ""), acc.get("subtype"))
     credit_data = acc.get("creditData") or {}
 
     credit_limit: Optional[Decimal] = None
@@ -202,6 +239,7 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
     minimum_payment: Optional[Decimal] = None
     card_brand: Optional[str] = None
     card_level: Optional[str] = None
+    shared_balance_group: Optional[str] = None
 
     if account_type == "credit_card" and credit_data:
         raw_limit = credit_data.get("creditLimit")
@@ -214,6 +252,9 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
             minimum_payment = Decimal(str(raw_min))
         card_brand = credit_data.get("brand") or None
         card_level = credit_data.get("level") or None
+        shared_balance_group = _consolidated_credit_balance_group(
+            credit_data, acc.get("balance"), acc.get("currencyCode") or "USD"
+        )
 
     return AccountData(
         external_id=acc["id"],
@@ -227,6 +268,10 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
         minimum_payment=minimum_payment,
         card_brand=card_brand,
         card_level=card_level,
+        # Brazil has no IBAN; Pluggy's `number` is the branch/account number
+        # (or the card number for credit cards), which serves the same purpose.
+        masked_number=mask_last4(acc.get("number")),
+        shared_balance_group=shared_balance_group,
     )
 
 
@@ -262,7 +307,7 @@ class PluggyProvider(BankProvider):
                 f"{PLUGGY_API_BASE}/auth",
                 json={
                     "clientId": settings.pluggy_client_id,
-                    "clientSecret": settings.pluggy_client_secret,
+                    "clientSecret": settings.pluggy_client_secret.get_secret_value(),
                 },
             )
             resp.raise_for_status()
@@ -526,7 +571,7 @@ class PluggyProvider(BankProvider):
         # Pluggy manages API keys at the provider level, not per-connection
         return credentials
 
-    async def trigger_refresh(self, credentials: dict) -> RefreshOutcome:
+    async def trigger_refresh(self, credentials: dict | None) -> RefreshOutcome:
         """Trigger ``PATCH /items/{id}`` and poll the item until it leaves
         the ``UPDATING`` state.
 
@@ -755,7 +800,12 @@ class PluggyProvider(BankProvider):
         return None
 
     @staticmethod
-    def _map_account_type(pluggy_type: str) -> str:
+    def _map_account_type(pluggy_type: str, pluggy_subtype: Optional[str] = None) -> str:
+        # Pluggy reports both checking and savings accounts as BANK, with the
+        # distinction carried in subtype (e.g. SAVINGS_ACCOUNT). Prefer the
+        # subtype so a savings account is not displayed as checking.
+        if (pluggy_subtype or "").upper() in {"SAVINGS", "SAVINGS_ACCOUNT"}:
+            return "savings"
         mapping = {
             "BANK": "checking",
             "CREDIT": "credit_card",

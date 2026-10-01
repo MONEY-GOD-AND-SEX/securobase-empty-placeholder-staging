@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { connections } from '@/lib/api'
@@ -21,12 +21,14 @@ interface ConnectionSettingsDialogProps {
   open: boolean
   onClose: () => void
   connection: BankConnection | null
+  supportsAssetSync?: boolean
 }
 
 export function ConnectionSettingsDialog({
   open,
   onClose,
   connection,
+  supportsAssetSync = false,
 }: ConnectionSettingsDialogProps) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
@@ -34,14 +36,18 @@ export function ConnectionSettingsDialog({
   const [displayName, setDisplayName] = useState('')
   const [payeeSource, setPayeeSource] = useState<PayeeSource>('auto')
   const [importPending, setImportPending] = useState(true)
+  const [syncAssets, setSyncAssets] = useState(true)
 
-  useEffect(() => {
+  const [formSource, setFormSource] = useState<{ connection: typeof connection } | null>(null)
+  if (!formSource || formSource.connection !== connection) {
+    setFormSource({ connection })
     if (connection) {
       setDisplayName(connection.display_name ?? '')
       setPayeeSource(connection.settings?.payee_source ?? 'auto')
       setImportPending(connection.settings?.import_pending ?? true)
+      setSyncAssets(connection.settings?.sync_assets ?? true)
     }
-  }, [connection])
+  }
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -49,6 +55,8 @@ export function ConnectionSettingsDialog({
         display_name: displayName.trim() || null,
         payee_source: payeeSource,
         import_pending: importPending,
+        // Only persist asset-sync for connectors that actually import holdings.
+        ...(supportsAssetSync ? { sync_assets: syncAssets } : {}),
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['connections'] })
@@ -100,6 +108,21 @@ export function ConnectionSettingsDialog({
               className="h-4 w-4 rounded border-border text-primary focus:ring-primary"
             />
           </div>
+          {supportsAssetSync && (
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="sync-assets">{t('connections.syncAssets')}</Label>
+                <p className="text-[11px] text-muted-foreground">{t('connections.syncAssetsHint')}</p>
+              </div>
+              <input
+                id="sync-assets"
+                type="checkbox"
+                checked={syncAssets}
+                onChange={(e) => setSyncAssets(e.target.checked)}
+                className="mt-1 h-4 w-4 rounded border-border text-primary focus:ring-primary"
+              />
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>

@@ -3,6 +3,7 @@ import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
+from app.core.app_clock import use_timezone
 from app.worker import celery_app
 from app.core.config import get_settings
 
@@ -22,7 +23,7 @@ async def _sync_fx_rates() -> int:
 
     engine, session_maker = _make_session_maker()
     try:
-        async with session_maker() as session:
+        async with session_maker() as session, use_timezone(session, fresh=True):
             count = await sync_rates(session)
         return count
     finally:
@@ -39,24 +40,75 @@ async def _restamp_recurring_fx() -> int:
 
     engine, session_maker = _make_session_maker()
     try:
-        async with session_maker() as session:
+        async with session_maker() as session, use_timezone(session, fresh=True):
             users = (await session.execute(select(User))).scalars().all()
-        count = 0
-        for user in users:
-            primary = user.primary_currency
+            count = 0
+            for user in users:
+                primary = user.primary_currency
+                result = await session.execute(
+                    select(RecurringTransaction).where(
+                        RecurringTransaction.user_id == user.id,
+                        RecurringTransaction.is_active == True,
+                        RecurringTransaction.currency != primary,
+                    )
+                )
+                for rec in result.scalars().all():
+                    await stamp_primary_amount(
+                        session, user.id, rec, date_field="start_date",
+                    )
+                    count += 1
+            await session.commit()
+    finally:
+        await engine.dispose()
+    return count
+
+
+async def _restamp_fallback_transactions() -> int:
+    """Heal cross-currency transactions that lack a real FX rate.
+
+    Targets rows left NULL or stamped with the legacy 1:1 fallback (issue #353)
+    and *upgrades* them once a real rate for their date is available. Uses only
+    already-stored rates (``allow_fetch=False``) so a large heal never hammers
+    the FX provider — the daily ``sync_fx_rates`` task keeps rates fresh.
+
+    Conservative by construction: ``stamp_primary_amount`` only writes when a real
+    rate resolves and leaves the fields untouched otherwise, so an existing row is
+    never overwritten with NULL. A transaction that is currently visible in totals
+    (even with a stale 1:1 value) is never pushed into a "not converted" limbo — it
+    stays as-is until a real rate lets us fix it for good.
+    """
+    from sqlalchemy import or_, select
+
+    from app.models.transaction import Transaction
+    from app.models.user import User
+    from app.services.fx_rate_service import stamp_primary_amount
+
+    settings = get_settings()
+    engine, session_maker = _make_session_maker()
+    try:
+        async with session_maker() as session, use_timezone(session, fresh=True):
+            users = {
+                u.id: u.primary_currency
+                for u in (await session.execute(select(User))).scalars().all()
+            }
             result = await session.execute(
-                select(RecurringTransaction).where(
-                    RecurringTransaction.user_id == user.id,
-                    RecurringTransaction.is_active == True,
-                    RecurringTransaction.currency != primary,
+                select(Transaction).where(
+                    or_(
+                        Transaction.amount_primary.is_(None),
+                        Transaction.fx_rate_used == 1,
+                    )
                 )
             )
-            for rec in result.scalars().all():
-                await stamp_primary_amount(
-                    session, user.id, rec, date_field="start_date",
-                )
-                count += 1
-        await session.commit()
+            count = 0
+            for tx in result.scalars().all():
+                primary = users.get(tx.user_id, settings.default_currency)
+                if tx.currency == primary:
+                    continue  # genuine same-currency row — never touch
+                before = (tx.amount_primary, tx.fx_rate_used)
+                await stamp_primary_amount(session, tx.user_id, tx, allow_fetch=False)
+                if (tx.amount_primary, tx.fx_rate_used) != before:
+                    count += 1
+            await session.commit()
     finally:
         await engine.dispose()
     return count
@@ -83,4 +135,17 @@ def restamp_recurring_fx() -> dict:
         return {"skipped": True, "reason": "fx_sync_mode is not scheduled"}
     count = asyncio.run(_restamp_recurring_fx())
     logger.info("Recurring FX re-stamp complete: %d records updated", count)
+    return {"restamped": count}
+
+
+@celery_app.task(name="app.tasks.fx_rate_tasks.restamp_fallback_fx")
+def restamp_fallback_fx() -> dict:
+    """Celery task: heal cross-currency transactions stamped with the 1:1 fallback
+    (or left NULL) once real rates are available. Skips if fx_sync_mode != scheduled."""
+    settings = get_settings()
+    if settings.fx_sync_mode != "scheduled":
+        logger.debug("Fallback FX heal skipped (fx_sync_mode=%s)", settings.fx_sync_mode)
+        return {"skipped": True, "reason": "fx_sync_mode is not scheduled"}
+    count = asyncio.run(_restamp_fallback_transactions())
+    logger.info("Fallback FX heal complete: %d transactions healed", count)
     return {"restamped": count}

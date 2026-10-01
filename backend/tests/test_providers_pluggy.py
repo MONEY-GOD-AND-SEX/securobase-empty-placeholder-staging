@@ -345,3 +345,132 @@ async def test_get_transactions_follows_cursor_until_next_is_null():
     assert first.kwargs["params"]["createdAtFrom"] == "2026-01-01"
     assert "after" not in first.kwargs["params"]
     assert client.get.await_args_list[1].kwargs["params"]["after"] == "CUR2"
+
+
+# ----- masked account number (issue #408) -----
+
+
+def test_build_account_data_masks_account_number():
+    """Brazil has no IBAN; Pluggy's `number` is the branch/account number."""
+    from app.providers.pluggy import _build_account_data
+
+    acc = {
+        "id": "acc-1",
+        "name": "Conta Corrente",
+        "type": "BANK",
+        "number": "1234-56789",
+        "balance": 100,
+        "currencyCode": "BRL",
+    }
+    out = _build_account_data(acc, PluggyProvider._map_account_type)
+    assert out.masked_number == "6789"
+
+
+def test_build_account_data_without_number_leaves_mask_none():
+    from app.providers.pluggy import _build_account_data
+
+    acc = {"id": "acc-2", "name": "Conta", "type": "BANK", "balance": 0}
+    out = _build_account_data(acc, PluggyProvider._map_account_type)
+    assert out.masked_number is None
+
+
+def test_build_account_data_groups_consolidated_credit_line():
+    from app.providers.pluggy import _build_account_data
+
+    credit_data = {
+        "disaggregatedCreditLimits": [{
+            "lineName": "CREDITO_A_VISTA",
+            "creditLineLimitType": "LIMITE_CREDITO_TOTAL",
+            "consolidationType": "CONSOLIDADO",
+            "usedAmount": 250.50,
+            "customizedLimitAmount": 1000,
+        }]
+    }
+    visa = _build_account_data(
+        {"id": "visa", "name": "Visa", "type": "CREDIT", "balance": 250.50,
+         "currencyCode": "BRL", "creditData": credit_data},
+        PluggyProvider._map_account_type,
+    )
+    mastercard = _build_account_data(
+        {"id": "mc", "name": "Mastercard", "type": "CREDIT", "balance": 250.50,
+         "currencyCode": "BRL", "creditData": credit_data},
+        PluggyProvider._map_account_type,
+    )
+
+    assert visa.shared_balance_group is not None
+    assert visa.shared_balance_group == mastercard.shared_balance_group
+
+
+def test_build_account_data_does_not_group_individual_credit_line():
+    from app.providers.pluggy import _build_account_data
+
+    acc = _build_account_data(
+        {"id": "visa", "name": "Visa", "type": "CREDIT", "balance": 250,
+         "currencyCode": "BRL", "creditData": {"disaggregatedCreditLimits": [{
+             "lineName": "CREDITO_A_VISTA",
+             "creditLineLimitType": "LIMITE_CREDITO_TOTAL",
+             "consolidationType": "INDIVIDUAL",
+             "usedAmount": 250,
+             "limitAmount": 1000,
+         }]}},
+        PluggyProvider._map_account_type,
+    )
+
+    assert acc.shared_balance_group is None
+
+
+def test_build_account_data_maps_bank_savings_subtype_to_savings():
+    from app.providers.pluggy import _build_account_data
+
+    acc = {
+        "id": "acc-savings",
+        "name": "Poupança",
+        "type": "BANK",
+        "subtype": "SAVINGS_ACCOUNT",
+        "balance": 0,
+        "currencyCode": "BRL",
+    }
+
+    out = _build_account_data(acc, PluggyProvider._map_account_type)
+
+    assert out.type == "savings"
+
+
+@pytest.mark.parametrize(
+    "pluggy_type,pluggy_subtype,expected",
+    [
+        ("BANK", "CHECKING_ACCOUNT", "checking"),
+        ("BANK", "SAVINGS_ACCOUNT", "savings"),
+        ("CREDIT", "CREDIT_CARD", "credit_card"),
+        # `subtype` is documented as always present, but a payload that omits
+        # it must still fall back to the `type` mapping.
+        ("BANK", None, "checking"),
+        ("CREDIT", None, "credit_card"),
+        # Unknown values keep the historical "checking" default.
+        ("SOMETHING_NEW", None, "checking"),
+    ],
+)
+def test_map_account_type_covers_pluggy_type_subtype_pairs(
+    pluggy_type, pluggy_subtype, expected
+):
+    """Pluggy's enums are `type` ∈ (BANK, CREDIT) and `subtype` ∈
+    (CHECKING_ACCOUNT, SAVINGS_ACCOUNT, CREDIT_CARD). Pin every real pair so
+    the savings branch can't swallow the others.
+    """
+    assert PluggyProvider._map_account_type(pluggy_type, pluggy_subtype) == expected
+
+
+def test_build_account_data_without_subtype_still_maps_bank_to_checking():
+    from app.providers.pluggy import _build_account_data
+
+    acc = {
+        "id": "acc-checking",
+        "name": "Conta Corrente",
+        "type": "BANK",
+        "balance": 0,
+        "currencyCode": "BRL",
+    }
+
+    out = _build_account_data(acc, PluggyProvider._map_account_type)
+
+    assert out.type == "checking"
